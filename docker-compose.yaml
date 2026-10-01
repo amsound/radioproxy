@@ -1,0 +1,10 @@
+services:
+  radioproxy:
+    image: ghcr.io/amsound/radioproxy:latest
+    container_name: radioproxy
+    init: true
+    ports:
+      - "8010:8010"
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+    restart: unless-stopped

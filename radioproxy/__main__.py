@@ -1,0 +1,188 @@
+"""radioproxy server.
+
+  GET /stream/<http|https>/<host>/<path>?<query>   any station address
+  GET /tunein/<station id>                          TuneIn station, e.g. /tunein/s345724
+  GET /health
+
+The reply is the station as one plain, never-ending HTTP audio stream. The
+audio itself is never re-encoded.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import itertools
+import logging
+import os
+import signal
+import sys
+import time
+
+import aiohttp
+
+from .http import USER_AGENT
+from .sources import TUNEIN_ID_RE, open_source, tunein_address
+
+logger = logging.getLogger("radioproxy")
+
+PORT = int(os.environ.get("PORT", "8010"))
+REQUEST_TIMEOUT_S = 10.0
+OPEN_TIMEOUT_S = 30.0
+_request_ids = itertools.count(1)
+
+
+def _build_date() -> str:
+    try:
+        with open("/app/BUILD_DATE", encoding="utf-8") as f:
+            return f.read().strip() or "unknown"
+    except OSError:
+        return "unknown"
+
+
+async def _reply(writer: asyncio.StreamWriter, status: str, body: str) -> None:
+    data = (body + "\n").encode()
+    writer.write(
+        f"HTTP/1.1 {status}\r\nContent-Type: text/plain; charset=utf-8\r\n"
+        f"Content-Length: {len(data)}\r\nConnection: close\r\n\r\n".encode() + data
+    )
+    await writer.drain()
+
+
+def _station(target: str) -> tuple[str, str | None, str] | None:
+    """(label, tunein id or None, address) for a request target, or None if it isn't a stream."""
+    path, _, query = target.partition("?")
+    parts = path.split("/", 3)
+    if len(parts) == 3 and parts[1] == "tunein" and TUNEIN_ID_RE.match(parts[2].lower()):
+        return parts[2].lower(), parts[2].lower(), ""
+    if len(parts) == 4 and parts[1] == "stream" and parts[2] in ("http", "https") and parts[3]:
+        address = f"{parts[2]}://{parts[3]}" + (f"?{query}" if query else "")
+        return parts[3].split("/", 1)[0], None, address
+    return None
+
+
+class Server:
+    def __init__(self) -> None:
+        self._session: aiohttp.ClientSession | None = None
+
+    async def handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            await self._handle(reader, writer)
+        except (ConnectionError, asyncio.IncompleteReadError, asyncio.TimeoutError):
+            pass
+        except Exception:
+            logger.exception("request failed")
+        finally:
+            writer.close()
+            with contextlib.suppress(Exception):
+                await writer.wait_closed()
+
+    async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), REQUEST_TIMEOUT_S)
+        request_line = head.split(b"\r\n", 1)[0].decode("latin-1")
+        try:
+            method, target, _ = request_line.split(" ", 2)
+        except ValueError:
+            return await _reply(writer, "400 Bad Request", "bad request")
+        if method not in ("GET", "HEAD"):
+            return await _reply(writer, "405 Method Not Allowed", "GET only")
+        if target.split("?", 1)[0] == "/health":
+            return await _reply(writer, "200 OK", "ok")
+
+        station = _station(target)
+        if station is None:
+            return await _reply(
+                writer, "404 Not Found",
+                "use /stream/<http|https>/<host>/<path>?<query> or /tunein/<station id>",
+            )
+        name, tunein_id, address = station
+        peer = (writer.get_extra_info("peername") or ("?",))[0]
+        label = f"[{name} #{next(_request_ids)} <- {peer}]"
+
+        async def renew() -> str:
+            return await tunein_address(self._session, tunein_id, fresh=True)
+
+        async def open_station():
+            if not tunein_id:
+                return await open_source(self._session, address, label)
+            try:
+                return await open_source(self._session, await tunein_address(self._session, tunein_id), label, renew)
+            except Exception:
+                # A reused address may have gone stale: look it up again once.
+                return await open_source(self._session, await renew(), label, renew)
+
+        try:
+            stream = await asyncio.wait_for(open_station(), OPEN_TIMEOUT_S)
+        except Exception as exc:
+            logger.warning("%s could not open: %s", label, exc or type(exc).__name__)
+            return await _reply(writer, "502 Bad Gateway", f"could not open station: {exc or type(exc).__name__}")
+
+        started = time.monotonic()
+        stream.sent = 0
+        logger.info("%s connected: %s", label, stream.description)
+        try:
+            writer.write(
+                f"HTTP/1.1 200 OK\r\nServer: radioproxy\r\nContent-Type: {stream.content_type}\r\n"
+                "Cache-Control: no-cache, no-store\r\nConnection: close\r\n\r\n".encode()
+            )
+            await writer.drain()
+            if method == "HEAD":
+                return
+            # The listener sends nothing more, so any read ending means it hung up.
+            gone = asyncio.ensure_future(reader.read())
+            pump = asyncio.ensure_future(self._pump(stream, writer))
+            done, pending = await asyncio.wait({gone, pump}, return_when=asyncio.FIRST_COMPLETED)
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            if gone in done:
+                gone.exception()   # a reset connection is just the listener leaving
+            if pump in done:
+                pump.result()   # re-raises if the station side failed
+                logger.info("%s station ended", label)
+        except (ConnectionError, asyncio.CancelledError):
+            pass
+        except Exception as exc:
+            logger.warning("%s stream failed: %s", label, exc)
+        finally:
+            await stream.close()
+            logger.info(
+                "%s disconnected after %.0fs, %.1f MB sent",
+                label, time.monotonic() - started, stream.sent / 1e6,
+            )
+
+    @staticmethod
+    async def _pump(stream, writer: asyncio.StreamWriter) -> None:
+        async for chunk in stream.chunks():
+            writer.write(chunk)
+            await writer.drain()
+            stream.sent += len(chunk)
+
+    async def run(self) -> None:
+        # Keep idle connections to stations open, so the next listener skips the TLS setup.
+        self._session = aiohttp.ClientSession(
+            headers={"User-Agent": USER_AGENT},
+            connector=aiohttp.TCPConnector(keepalive_timeout=120, limit_per_host=16),
+        )
+        server = await asyncio.start_server(self.handle, "0.0.0.0", PORT, limit=64 * 1024)
+        logger.info(
+            "listening on :%d (built %s, python %s)", PORT, _build_date(), sys.version.split()[0]
+        )
+        stop = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            loop.add_signal_handler(sig, stop.set)
+        async with server:
+            await stop.wait()
+        await self._session.close()
+
+
+def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s [%(name)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+    )
+    asyncio.run(Server().run())
+
+
+if __name__ == "__main__":
+    main()

@@ -102,7 +102,16 @@ class Listener:
         unsent, rtt_ms, retransmits = self._tcp()
         row = Row(now, info.segment, audio_s, len(data), info.download_s, blocked_s, unsent, rtt_ms, retransmits, info.program_time)
         if info.segment is not None:
-            self.rows.append(row)
+            last = self.rows[-1] if self.rows else None
+            if last is not None and last.segment == info.segment:
+                # Another slice of the same segment: one timeline row per segment.
+                last.size += row.size
+                last.blocked_s += row.blocked_s
+                if last.audio_s is not None and row.audio_s is not None:
+                    last.audio_s += row.audio_s
+                last.unsent, last.rtt_ms, last.retransmits = unsent, rtt_ms, retransmits
+            else:
+                self.rows.append(row)
             return
         # A continuous stream arrives in many small pieces: one row per ROW_EVERY_S.
         pending = self._pending_row

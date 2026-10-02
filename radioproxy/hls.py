@@ -13,17 +13,27 @@ from urllib.parse import urljoin
 import aiohttp
 
 from . import mp4
-from .adts import AacError, AdtsFramer, strip_id3
+from .adts import SAMPLE_RATES, AacError, AdtsFramer, frame_len, strip_id3
 from .http import HttpError, fetch
 from .ts import TsDemuxer, TsError, looks_like_ts
 
 logger = logging.getLogger("radioproxy")
 
-# Start this many segments back from live, as the HLS spec asks of players. It is
-# the listener's head start: ~12 s on 4 s segments, ~48 s on Apple's 16 s ones.
-START_SEGMENTS_BACK = 3
-RELOAD_MIN_S = 1.0
-RELOAD_MAX_S = 6.0
+# Start up to this many segments back from live (fewer on a short playlist).
+#
+# The first ones are sent at once: the listener's head start. Three segments
+# where the playlist allows, as the HLS spec asks players to hold: ~12 s on 4 s
+# segments, ~48 s on Apple's 16 s ones.
+#
+# The last RESERVE_SEGMENTS are not: from there on audio is fed out at real time
+# in small slices, so radioproxy always has a segment in hand and the connection
+# is never silent while the station gets round to publishing its next one. A
+# silent connection makes some players hang up (Audio Pro/LinkPlay: after 15 s,
+# and Apple publishes 16 s segments, irregularly).
+START_SEGMENTS_BACK = 5
+RESERVE_SEGMENTS = 2
+SLICE_S = 0.5
+RELOAD_S = 1.0   # how often to look for the next segment once the current one is sent
 # A live playlist that stays broken this long ends the stream.
 GIVE_UP_AFTER_S = 60.0
 
@@ -130,6 +140,25 @@ def parse_media(text: str, base: str) -> MediaPlaylist:
     return MediaPlaylist(target or 6.0, segments, ended)
 
 
+def _slices(data: bytes, seconds: float):
+    """Cut ADTS audio at frame boundaries: (offset in seconds, bytes) for each ~seconds of it."""
+    rate = SAMPLE_RATES[(data[2] >> 2) & 0x0F]
+    per_slice = max(1, int(seconds * rate / 1024))
+    i, start, frames, done, n = 0, 0, 0, 0, len(data)
+    while i + 7 <= n:
+        length = frame_len(data, i)
+        if not length or i + length > n:
+            break
+        i += length
+        frames += 1
+        if frames == per_slice:
+            yield done * 1024 / rate, data[start:i]
+            done += frames
+            start, frames = i, 0
+    if start < n:
+        yield done * 1024 / rate, data[start:]
+
+
 class HlsStream:
     """One listener's view of an HLS station, as ADTS bytes."""
 
@@ -158,6 +187,7 @@ class HlsStream:
         self._ts = TsDemuxer()
         self._framer = AdtsFramer()
         self._download_s = 0.0
+        self._due: float | None = None   # when the next paced segment's audio is due to start going out
         self.description = ""
         self.info = ChunkInfo()
         # Called with a line of text when something notable happens to the stream.
@@ -167,7 +197,9 @@ class HlsStream:
         playlist = await self._select(self._first_url, self._first_text)
         if not playlist.segments:
             raise HlsError("playlist has no segments")
-        start = playlist.segments[-START_SEGMENTS_BACK:]
+        back = min(START_SEGMENTS_BACK, max(1, len(playlist.segments) - 1))
+        start = playlist.segments[-back:]
+        self._burst = max(1, len(start) - RESERVE_SEGMENTS)
         self._next_seq = start[0].seq
         self._pending = list(start)
         # Convert the first segment now, so a stream we can't handle fails before
@@ -175,7 +207,7 @@ class HlsStream:
         first = self._pending.pop(0)
         self._first = await self._convert(first)
         self._first_info = self._info(first)
-        head_start = sum(s.duration for s in start)
+        head_start = sum(s.duration for s in start[:self._burst])
         self.description += f", {playlist.target:g}s segments, {head_start:.0f}s head start"
 
     async def _select(self, url: str, text: str) -> MediaPlaylist:
@@ -195,10 +227,14 @@ class HlsStream:
         self.info = self._first_info
         yield self._first
         self._first = b""
-        for segment in self._pending:
+        burst = self._burst - 1   # the first segment has just gone
+        for segment in self._pending[:burst]:
             data = await self._convert(segment)
             self.info = self._info(segment)
             yield data
+        for segment in self._pending[burst:]:
+            async for piece in self._paced(segment):
+                yield piece
         self._pending = []
 
         failing_since: float | None = None
@@ -219,13 +255,32 @@ class HlsStream:
             if playlist.segments and playlist.segments[0].seq > self._next_seq:
                 self.note(f"fell behind: skipped {playlist.segments[0].seq - self._next_seq} segments")
             for segment in new:
-                data = await self._convert(segment)
-                if data:
-                    self.info = self._info(segment)
-                    yield data
+                async for piece in self._paced(segment):
+                    yield piece
             if playlist.ended and not new:
                 return
-            await asyncio.sleep(min(RELOAD_MAX_S, max(RELOAD_MIN_S, self._target / 2)))
+            if not new:
+                await asyncio.sleep(RELOAD_S)
+
+    async def _paced(self, segment: Segment) -> AsyncIterator[bytes]:
+        """One segment's audio, released at real time against a running schedule.
+
+        The schedule is absolute, so time spent downloading or waiting for the
+        station is made up rather than accumulating. A segment that is already
+        more than its own length late is sent at once.
+        """
+        data = await self._convert(segment)
+        if not data:
+            return
+        self.info = self._info(segment)
+        now = time.monotonic()
+        start = now if self._due is None else max(self._due, now - segment.duration)
+        self._due = start + segment.duration
+        for offset_s, piece in _slices(data, SLICE_S):
+            delay = start + offset_s - time.monotonic()
+            if delay > 0:
+                await asyncio.sleep(delay)
+            yield piece
 
     async def _reload(self) -> MediaPlaylist:
         try:

@@ -42,6 +42,11 @@ _AAC_LC = "mp4a.40.2"
 _AAC_CODECS = ("mp4a.40.2", "mp4a.40.5", "mp4a.40.29")
 
 
+def _refused(status: int) -> bool:
+    """A 4xx answer: the address itself is turned down (signed addresses end this way)."""
+    return 400 <= status < 500 and status not in (408, 429)
+
+
 class HlsError(Exception):
     pass
 
@@ -187,6 +192,7 @@ class HlsStream:
         self._ts = TsDemuxer()
         self._framer = AdtsFramer()
         self._download_s = 0.0
+        self._renewed: dict[int, Segment] = {}   # segments as listed under the newest signed address
         self._due: float | None = None   # when the next paced segment's audio is due to start going out
         self.description = ""
         self.info = ChunkInfo()
@@ -286,19 +292,38 @@ class HlsStream:
         try:
             _, text = await fetch(self._session, self._media_url, text=True)
         except HttpError as exc:
-            if self._refresh is None or exc.status not in (401, 403, 404, 410):
+            if self._refresh is None or not _refused(exc.status):
                 raise
-            # A signed address ran out: get a new one and carry on from the same segment.
-            self.note(f"address expired (HTTP {exc.status}); fetching a new one")
-            url = await self._refresh()
-            url, text = await fetch(self._session, url, text=True)
-            return await self._select(url, text)
+            return await self._renew(exc.status)
         return parse_media(text, self._media_url)
+
+    async def _renew(self, status: int) -> MediaPlaylist:
+        """A signed address ran out: get a new one and carry on from the same segment."""
+        self.note(f"address expired (HTTP {status}); fetching a new one")
+        url = await self._refresh()
+        url, text = await fetch(self._session, url, text=True)
+        playlist = await self._select(url, text)
+        # Segments already queued still carry the old signature; these replace them.
+        self._renewed = {s.seq: s for s in playlist.segments}
+        return playlist
 
     async def _convert(self, segment: Segment) -> bytes:
         """Download one segment and return its audio as whole ADTS frames."""
         started = time.monotonic()
-        data = await self._download(segment.url)
+        segment = self._renewed.get(segment.seq, segment)
+        try:
+            data = await self._download(segment.url)
+        except HttpError as exc:
+            # The segment's own address was turned down: the playlist's signature has
+            # run out. Take the same segment from a freshly signed playlist.
+            try:
+                playlist = await self._renew(exc.status)
+            except (HttpError, aiohttp.ClientError, asyncio.TimeoutError) as again:
+                raise HlsError(f"segment download failed: {exc}; no new address: {again}") from again
+            segment = next((s for s in playlist.segments if s.seq >= segment.seq), None)
+            if segment is None:
+                raise HlsError(f"segment download failed: {exc}") from exc
+            data = await self._download(segment.url, renewable=False)
         took = self._download_s = time.monotonic() - started
         if segment.duration and took > segment.duration:
             self.note(f"slow segment {segment.seq}: {took:.1f}s to download {segment.duration:.0f}s of audio")
@@ -308,8 +333,8 @@ class HlsStream:
         try:
             if segment.map_url:
                 if segment.map_url != self._init_url:
-                    init = mp4.parse_init(await self._download(segment.map_url))
-                    if self._init is not None:
+                    init = mp4.parse_init(await self._download(segment.map_url, renewable=False))
+                    if self._init is not None and init.config != self._init.config:
                         self.note(
                             f"station changed its audio description at segment {segment.seq}: "
                             f"{self._init.config} -> {init.config}"
@@ -326,12 +351,17 @@ class HlsStream:
     def _info(self, segment: Segment) -> ChunkInfo:
         return ChunkInfo(segment.seq, segment.duration, self._download_s, segment.program_time)
 
-    async def _download(self, url: str) -> bytes:
+    async def _download(self, url: str, *, renewable: bool = True) -> bytes:
+        """Fetch one file, trying three times. A refusal of a signed address is
+        raised as HttpError at once (retrying it cannot help) for the caller to renew."""
         last: Exception | None = None
         for attempt in range(3):
             try:
                 return (await fetch(self._session, url))[1]
             except (HttpError, aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                if (renewable and self._refresh is not None
+                        and isinstance(exc, HttpError) and _refused(exc.status)):
+                    raise
                 last = exc
                 await asyncio.sleep(0.5 * (attempt + 1))
         raise HlsError(f"segment download failed: {last}")

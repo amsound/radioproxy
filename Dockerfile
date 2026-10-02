@@ -15,6 +15,8 @@ RUN pip install -r requirements.txt
 COPY radioproxy ./radioproxy
 # Logged at startup, to tell which build is running.
 RUN date -u +"%Y-%m-%d %H:%M UTC" > /app/BUILD_DATE
+# Captures of what each listener was last sent are written here (mount a folder to keep them).
+RUN mkdir -p /data && chown appuser:appuser /data
 
 EXPOSE 8010
 USER appuser

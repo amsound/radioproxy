@@ -2,6 +2,7 @@
 
   GET /stream/<http|https>/<host>/<path>?<query>   any station address
   GET /tunein/<station id>                          TuneIn station, e.g. /tunein/s345724
+  GET /status                                       who is listening and how it is going (JSON)
   GET /health
 
 The reply is the station as one plain, never-ending HTTP audio stream. The
@@ -13,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import itertools
+import json
 import logging
 import os
 import signal
@@ -22,6 +24,7 @@ import time
 import aiohttp
 
 from .http import USER_AGENT
+from .listener import Listener
 from .sources import TUNEIN_ID_RE, open_source, tunein_address
 
 logger = logging.getLogger("radioproxy")
@@ -40,10 +43,10 @@ def _build_date() -> str:
         return "unknown"
 
 
-async def _reply(writer: asyncio.StreamWriter, status: str, body: str) -> None:
+async def _reply(writer: asyncio.StreamWriter, status: str, body: str, ctype: str = "text/plain; charset=utf-8") -> None:
     data = (body + "\n").encode()
     writer.write(
-        f"HTTP/1.1 {status}\r\nContent-Type: text/plain; charset=utf-8\r\n"
+        f"HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\n"
         f"Content-Length: {len(data)}\r\nConnection: close\r\n\r\n".encode() + data
     )
     await writer.drain()
@@ -64,6 +67,7 @@ def _station(target: str) -> tuple[str, str | None, str] | None:
 class Server:
     def __init__(self) -> None:
         self._session: aiohttp.ClientSession | None = None
+        self._listeners: dict[int, Listener] = {}
 
     async def handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
@@ -88,6 +92,9 @@ class Server:
             return await _reply(writer, "405 Method Not Allowed", "GET only")
         if target.split("?", 1)[0] == "/health":
             return await _reply(writer, "200 OK", "ok")
+        if target.split("?", 1)[0] == "/status":
+            body = json.dumps({"listeners": [x.status() for x in self._listeners.values()]}, indent=2)
+            return await _reply(writer, "200 OK", body, "application/json")
 
         station = _station(target)
         if station is None:
@@ -117,8 +124,10 @@ class Server:
             logger.warning("%s could not open: %s", label, exc or type(exc).__name__)
             return await _reply(writer, "502 Bad Gateway", f"could not open station: {exc or type(exc).__name__}")
 
-        started = time.monotonic()
-        stream.sent = 0
+        listener = Listener(label, name, peer, stream, writer.get_extra_info("socket"))
+        stream.note = listener.note
+        self._listeners[id(listener)] = listener
+        reason = "listener hung up"
         logger.info("%s connected: %s", label, stream.description)
         try:
             writer.write(
@@ -130,7 +139,7 @@ class Server:
                 return
             # The listener sends nothing more, so any read ending means it hung up.
             gone = asyncio.ensure_future(reader.read())
-            pump = asyncio.ensure_future(self._pump(stream, writer))
+            pump = asyncio.ensure_future(self._pump(stream, writer, listener))
             done, pending = await asyncio.wait({gone, pump}, return_when=asyncio.FIRST_COMPLETED)
             for task in pending:
                 task.cancel()
@@ -138,25 +147,29 @@ class Server:
             if gone in done:
                 gone.exception()   # a reset connection is just the listener leaving
             if pump in done:
-                pump.result()   # re-raises if the station side failed
-                logger.info("%s station ended", label)
+                reason = "station ended"
+                pump.result()      # re-raises if the station side failed
         except (ConnectionError, asyncio.CancelledError):
             pass
         except Exception as exc:
-            logger.warning("%s stream failed: %s", label, exc)
+            reason = f"stream failed: {exc}"
+            listener.note(reason)
         finally:
+            self._listeners.pop(id(listener), None)
             await stream.close()
+            saved = None if method == "HEAD" else listener.save(reason)
             logger.info(
-                "%s disconnected after %.0fs, %.1f MB sent",
-                label, time.monotonic() - started, stream.sent / 1e6,
+                "%s disconnected (%s) after %s%s",
+                label, reason, listener.summary(), f"; capture {saved}" if saved else "",
             )
 
     @staticmethod
-    async def _pump(stream, writer: asyncio.StreamWriter) -> None:
+    async def _pump(stream, writer: asyncio.StreamWriter, listener: Listener) -> None:
         async for chunk in stream.chunks():
             writer.write(chunk)
+            waiting = time.monotonic()
             await writer.drain()
-            stream.sent += len(chunk)
+            listener.record(chunk, stream.info, time.monotonic() - waiting)
 
     async def run(self) -> None:
         # Keep idle connections to stations open, so the next listener skips the TLS setup.

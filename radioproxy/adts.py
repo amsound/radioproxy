@@ -134,3 +134,18 @@ def strip_id3(data: bytes) -> bytes:
         size = (data[6] & 0x7F) << 21 | (data[7] & 0x7F) << 14 | (data[8] & 0x7F) << 7 | (data[9] & 0x7F)
         data = data[10 + size + (10 if data[5] & 0x10 else 0):]
     return data
+
+
+def scan(data: bytes) -> tuple[int, list[tuple[int, int, int]]]:
+    """Walk whole ADTS frames: (frame count, each distinct (profile, sample rate, channels) in order met)."""
+    frames, formats, i, n = 0, [], 0, len(data)
+    while n - i >= HEADER_LEN:
+        length = frame_len(data, i)
+        if not length or i + length > n:
+            break
+        fmt = (data[i + 2] >> 6, SAMPLE_RATES[(data[i + 2] >> 2) & 0x0F], ((data[i + 2] & 1) << 2) | (data[i + 3] >> 6))
+        if not formats or formats[-1] != fmt:
+            formats.append(fmt)
+        frames += 1
+        i += length
+    return frames, formats

@@ -16,7 +16,7 @@ from urllib.parse import urljoin, urlsplit
 
 import aiohttp
 
-from .hls import HlsStream
+from .hls import ChunkInfo, HlsStream
 from .http import FETCH_TIMEOUT, HttpError
 
 logger = logging.getLogger("radioproxy")
@@ -82,6 +82,8 @@ class PassthroughStream:
         self._first = b""
         self.content_type = resp.headers.get("Content-Type", "audio/mpeg").split(";", 1)[0].strip()
         self.description = f"direct {self.content_type}"
+        self.info = ChunkInfo()
+        self.note = lambda text: None
 
     async def open(self) -> None:
         self._first = await self._resp.content.readany()

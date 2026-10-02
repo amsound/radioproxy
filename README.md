@@ -15,6 +15,7 @@ The station is in the address. Nothing else to configure.
 |---|---|
 | `/stream/<http or https>/<host>/<path>?<query>` | Any station address. Scheme first, then the station's own host, path and query, untouched. |
 | `/tunein/<station id>` | A TuneIn station, e.g. `/tunein/s345724`. Looked up fresh on every connect, and again whenever the signed address expires. |
+| `/status` | Who is listening right now and how it is going (JSON). |
 | `/health` | Liveness check (used by the Docker healthcheck). |
 
 ```
@@ -62,10 +63,13 @@ services:
     init: true
     ports:
       - "8010:8010"
+    volumes:
+      - ./radioproxy-data:/data
     restart: unless-stopped
 ```
 
-`PORT` (default `8010`) is the only setting.
+`PORT` (default `8010`) is the only setting. The data folder must be writable by the container's user
+(`sudo chown 10001:10001 radioproxy-data`); without it radioproxy runs the same, just without captures.
 
 GitHub Actions (`.github/workflows/image.yml`) builds the arm64 image on every
 push to `main` and publishes `ghcr.io/amsound/radioproxy:latest`, plus
@@ -75,14 +79,36 @@ push to `main` and publishes `ghcr.io/amsound/radioproxy:latest`, plus
 
 ```
 [s345724 #3 <- 192.168.70.51] connected: HLS mp4a.40.2 281k, 16s segments, 48s head start
-[s345724 #3 <- 192.168.70.51] slow segment 181234: 19.2s to download 16s of audio
+[s345724 #3 <- 192.168.70.51] slow segment 2648383: 19.2s to download 16s of audio
 [s345724 #3 <- 192.168.70.51] address expired (HTTP 403); fetching a new one
-[s345724 #3 <- 192.168.70.51] disconnected after 21604s, 691.2 MB sent
+[s345724 #3 <- 192.168.70.51] station changed its audio description at segment 2648391: ...
+[s345724 #3 <- 192.168.70.51] audio format changed mid-stream: AAC profile 2, 48000 Hz, 2 ch -> ...
+[s345724 #3 <- 192.168.70.51] disconnected (listener hung up) after 46317s, 1482.1 MB sent, 46380s of audio (listener holding ~63s), 0 B not yet accepted, round trip 4 ms, 31 retransmits; capture /data/20261002-075631-s345724.aac
 ```
 
 One line when a listener connects (what was chosen) and one when it leaves.
-In between, only trouble is logged: a slow or failed download, a skipped
-segment, a renewed address.
+In between, only notable things are logged: a slow or failed download, a
+skipped segment, a renewed address, a discontinuity the station flagged, or a
+change in the audio's format.
+
+## When a listener drops
+
+For each listener radioproxy keeps the last five minutes of audio exactly as
+sent. When the listener leaves, it writes two files to `/data` (the newest 12
+are kept):
+
+- `<time>-<station>.aac`: that audio. Decode it to see whether the data was
+  sound: `ffmpeg -v error -i <file> -f null -` prints nothing for clean audio.
+- `<time>-<station>.txt`: a report. When it connected and left and why, how
+  much audio was sent, roughly how much the player was holding, and a timeline
+  of each segment: when it was sent, how long it took to download, the
+  station's broadcast clock time, and readings from the listener's own TCP
+  connection (bytes it had not yet accepted, round-trip time, retransmissions,
+  time spent waiting for it to take data).
+
+"Listener holding" is audio sent minus time elapsed: about what the player has
+buffered if it is playing normally. A player that failed was playing roughly
+that far before the end of the audio file.
 
 ## Layout
 
@@ -94,3 +120,4 @@ segment, a renewed address.
 | `radioproxy/mp4.py` | Fragmented MP4 to raw AAC frames |
 | `radioproxy/ts.py` | MPEG-TS to the AAC stream |
 | `radioproxy/adts.py` | ADTS headers and whole-frame output |
+| `radioproxy/listener.py` | Per-listener capture, timeline, connection readings, report |

@@ -53,6 +53,18 @@ class Segment:
     url: str
     duration: float
     map_url: str | None
+    discontinuity: bool = False       # the station flagged a break before this segment
+    program_time: str | None = None   # broadcast clock time, when the station gives it
+
+
+@dataclass(frozen=True)
+class ChunkInfo:
+    """About the piece of audio a stream has just handed over."""
+
+    segment: int | None = None
+    duration: float | None = None
+    download_s: float | None = None
+    program_time: str | None = None
 
 
 @dataclass(frozen=True)
@@ -89,6 +101,7 @@ def pick_variant(variants: list[Variant]) -> Variant:
 
 def parse_media(text: str, base: str) -> MediaPlaylist:
     target, seq, duration, map_url, ended = 0.0, 0, 0.0, None, False
+    discontinuity, program_time = False, None
     segments: list[Segment] = []
     for line in (raw.strip() for raw in text.splitlines()):
         if not line:
@@ -106,9 +119,14 @@ def parse_media(text: str, base: str) -> MediaPlaylist:
                 raise HlsError("stream is encrypted")
         elif line.startswith("#EXT-X-ENDLIST"):
             ended = True
+        elif line.startswith("#EXT-X-DISCONTINUITY") and not line.startswith("#EXT-X-DISCONTINUITY-SEQUENCE"):
+            discontinuity = True
+        elif line.startswith("#EXT-X-PROGRAM-DATE-TIME:"):
+            program_time = line.split(":", 1)[1]
         elif not line.startswith("#"):
-            segments.append(Segment(seq, urljoin(base, line), duration, map_url))
+            segments.append(Segment(seq, urljoin(base, line), duration, map_url, discontinuity, program_time))
             seq += 1
+            discontinuity, program_time = False, None
     return MediaPlaylist(target or 6.0, segments, ended)
 
 
@@ -139,7 +157,11 @@ class HlsStream:
         self._init_url: str | None = None
         self._ts = TsDemuxer()
         self._framer = AdtsFramer()
+        self._download_s = 0.0
         self.description = ""
+        self.info = ChunkInfo()
+        # Called with a line of text when something notable happens to the stream.
+        self.note: Callable[[str], None] = lambda text: logger.info("%s %s", label, text)
 
     async def open(self) -> None:
         playlist = await self._select(self._first_url, self._first_text)
@@ -150,7 +172,9 @@ class HlsStream:
         self._pending = list(start)
         # Convert the first segment now, so a stream we can't handle fails before
         # the listener is told "200 OK".
-        self._first = await self._convert(self._pending.pop(0))
+        first = self._pending.pop(0)
+        self._first = await self._convert(first)
+        self._first_info = self._info(first)
         head_start = sum(s.duration for s in start)
         self.description += f", {playlist.target:g}s segments, {head_start:.0f}s head start"
 
@@ -168,10 +192,13 @@ class HlsStream:
         return playlist
 
     async def chunks(self) -> AsyncIterator[bytes]:
+        self.info = self._first_info
         yield self._first
         self._first = b""
         for segment in self._pending:
-            yield await self._convert(segment)
+            data = await self._convert(segment)
+            self.info = self._info(segment)
+            yield data
         self._pending = []
 
         failing_since: float | None = None
@@ -184,18 +211,17 @@ class HlsStream:
                 failing_since = failing_since or now
                 if now - failing_since > GIVE_UP_AFTER_S:
                     raise HlsError(f"playlist unavailable for {GIVE_UP_AFTER_S:g}s: {exc}") from exc
-                logger.warning("%s playlist reload failed (%s); retrying", self._label, exc)
+                self.note(f"playlist reload failed ({exc}); retrying")
                 await asyncio.sleep(2.0)
                 continue
 
             new = [s for s in playlist.segments if s.seq >= self._next_seq]
             if playlist.segments and playlist.segments[0].seq > self._next_seq:
-                logger.warning(
-                    "%s fell behind: skipped %d segments", self._label, playlist.segments[0].seq - self._next_seq
-                )
+                self.note(f"fell behind: skipped {playlist.segments[0].seq - self._next_seq} segments")
             for segment in new:
                 data = await self._convert(segment)
                 if data:
+                    self.info = self._info(segment)
                     yield data
             if playlist.ended and not new:
                 return
@@ -208,7 +234,7 @@ class HlsStream:
             if self._refresh is None or exc.status not in (401, 403, 404, 410):
                 raise
             # A signed address ran out: get a new one and carry on from the same segment.
-            logger.info("%s address expired (HTTP %d); fetching a new one", self._label, exc.status)
+            self.note(f"address expired (HTTP {exc.status}); fetching a new one")
             url = await self._refresh()
             url, text = await fetch(self._session, url, text=True)
             return await self._select(url, text)
@@ -218,16 +244,22 @@ class HlsStream:
         """Download one segment and return its audio as whole ADTS frames."""
         started = time.monotonic()
         data = await self._download(segment.url)
-        took = time.monotonic() - started
+        took = self._download_s = time.monotonic() - started
         if segment.duration and took > segment.duration:
-            logger.warning(
-                "%s slow segment %d: %.1fs to download %.0fs of audio", self._label, segment.seq, took, segment.duration
-            )
+            self.note(f"slow segment {segment.seq}: {took:.1f}s to download {segment.duration:.0f}s of audio")
+        if segment.discontinuity:
+            self.note(f"station flagged a discontinuity before segment {segment.seq}")
         self._next_seq = segment.seq + 1
         try:
             if segment.map_url:
                 if segment.map_url != self._init_url:
-                    self._init = mp4.parse_init(await self._download(segment.map_url))
+                    init = mp4.parse_init(await self._download(segment.map_url))
+                    if self._init is not None:
+                        self.note(
+                            f"station changed its audio description at segment {segment.seq}: "
+                            f"{self._init.config} -> {init.config}"
+                        )
+                    self._init = init
                     self._init_url = segment.map_url
                 return mp4.to_adts(data, self._init)
             if looks_like_ts(data):
@@ -235,6 +267,9 @@ class HlsStream:
             return self._framer.feed(strip_id3(data))
         except (mp4.Mp4Error, TsError, AacError) as exc:
             raise HlsError(f"cannot read segment {segment.seq}: {exc}") from exc
+
+    def _info(self, segment: Segment) -> ChunkInfo:
+        return ChunkInfo(segment.seq, segment.duration, self._download_s, segment.program_time)
 
     async def _download(self, url: str) -> bytes:
         last: Exception | None = None

@@ -6,5 +6,6 @@ services:
     ports:
       - "8010:8010"
     volumes:
+      - ./radioproxy-data:/data          # captures of what each listener was last sent
       - /etc/localtime:/etc/localtime:ro
     restart: unless-stopped

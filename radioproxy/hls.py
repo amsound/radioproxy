@@ -36,6 +36,12 @@ SLICE_S = 0.5
 RELOAD_S = 1.0   # how often to look for the next segment once the current one is sent
 # A live playlist that stays broken this long ends the stream.
 GIVE_UP_AFTER_S = 60.0
+# After a new address, how long to keep asking for a playlist whose segments are
+# signed afresh. Apple's segment signatures all run out together on a six-hourly
+# boundary, and for a few seconds after it the playlists it serves still carry
+# the old ones. Shorter than the listener's head start, so it never hears a gap.
+RESIGN_WAIT_S = 30.0
+RESIGN_POLL_S = 2.0
 
 _ATTR_RE = re.compile(r'([A-Z0-9-]+)=("[^"]*"|[^,]*)')
 _AAC_LC = "mp4a.40.2"
@@ -297,6 +303,44 @@ class HlsStream:
             return await self._renew(exc.status)
         return parse_media(text, self._media_url)
 
+    async def _resigned(self, segment: Segment, refused: HttpError) -> tuple[Segment, bytes]:
+        """A segment's address was turned down: get a new address, then the same
+        segment from a playlist whose signatures are current.
+
+        Right after Apple's signatures run out, even a new address can list the
+        old ones for a few seconds, so the playlist is asked again until a
+        segment is accepted or RESIGN_WAIT_S passes.
+        """
+        give_up = time.monotonic() + RESIGN_WAIT_S
+        try:
+            playlist = await self._renew(refused.status)
+        except (HttpError, aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            raise HlsError(f"segment download failed: {refused}; no new address: {exc}") from exc
+        tries = 0
+        while True:
+            current = next((s for s in playlist.segments if s.seq >= segment.seq), None)
+            if current is not None:
+                try:
+                    data = (await fetch(self._session, current.url))[1]
+                    if tries:
+                        self.note(f"segment {current.seq} accepted after {tries} more playlist reloads")
+                    return current, data
+                except (HttpError, aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                    refused = exc if isinstance(exc, HttpError) else refused
+                    last = exc
+            else:
+                last = HlsError(f"segment {segment.seq} no longer listed")
+            if time.monotonic() + RESIGN_POLL_S > give_up:
+                raise HlsError(f"segment download failed for {RESIGN_WAIT_S:g}s after a new address: {last}")
+            await asyncio.sleep(RESIGN_POLL_S)
+            tries += 1
+            try:
+                _, text = await fetch(self._session, self._media_url, text=True)
+                playlist = parse_media(text, self._media_url)
+                self._renewed = {s.seq: s for s in playlist.segments}
+            except (HttpError, aiohttp.ClientError, asyncio.TimeoutError, HlsError):
+                pass   # keep the playlist we have and try again
+
     async def _renew(self, status: int) -> MediaPlaylist:
         """A signed address ran out: get a new one and carry on from the same segment."""
         self.note(f"address expired (HTTP {status}); fetching a new one")
@@ -316,14 +360,7 @@ class HlsStream:
         except HttpError as exc:
             # The segment's own address was turned down: the playlist's signature has
             # run out. Take the same segment from a freshly signed playlist.
-            try:
-                playlist = await self._renew(exc.status)
-            except (HttpError, aiohttp.ClientError, asyncio.TimeoutError) as again:
-                raise HlsError(f"segment download failed: {exc}; no new address: {again}") from again
-            segment = next((s for s in playlist.segments if s.seq >= segment.seq), None)
-            if segment is None:
-                raise HlsError(f"segment download failed: {exc}") from exc
-            data = await self._download(segment.url, renewable=False)
+            segment, data = await self._resigned(segment, exc)
         took = self._download_s = time.monotonic() - started
         if segment.duration and took > segment.duration:
             self.note(f"slow segment {segment.seq}: {took:.1f}s to download {segment.duration:.0f}s of audio")

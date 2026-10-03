@@ -6,7 +6,7 @@ import asyncio
 import logging
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import AsyncIterator, Awaitable, Callable
 from urllib.parse import urljoin
 
@@ -86,6 +86,7 @@ class ChunkInfo:
     duration: float | None = None
     download_s: float | None = None
     program_time: str | None = None
+    piece_s: float | None = None   # seconds of audio in the piece, when the stream knows (MP4 output)
 
 
 @dataclass(frozen=True)
@@ -170,10 +171,22 @@ def _slices(data: bytes, seconds: float):
         yield done * 1024 / rate, data[start:]
 
 
+def _even_slices(data: bytes, duration: float, seconds: float):
+    """Cut data into equal pieces of about `seconds` each: (offset in seconds, bytes, seconds of audio)."""
+    count = max(1, round(duration / seconds))
+    size = -(-len(data) // count)
+    each = duration / count
+    for i in range(count):
+        piece = data[i * size:(i + 1) * size]
+        if piece:
+            yield i * each, piece, each
+
+
 class HlsStream:
-    """One listener's view of an HLS station, as ADTS bytes."""
+    """One listener's view of an HLS station: ADTS bytes, or fragmented MP4 if asked for."""
 
     content_type = "audio/aac"
+    capture_head = b""   # what a saved capture needs in front of it to be playable (MP4: the init segment)
 
     def __init__(
         self,
@@ -182,8 +195,13 @@ class HlsStream:
         text: str,
         label: str,
         refresh: Callable[[], Awaitable[str]] | None = None,
+        output: str = "adts",
     ) -> None:
         self._session = session
+        self._want_mp4 = output == "mp4"
+        self._as_mp4 = False             # settled by the first segment: only an fMP4 station can be sent as MP4
+        self._time_base: int | None = None
+        self._audio_s: float | None = None   # MP4 output: seconds of audio in the segment just converted
         self._label = label
         self._refresh = refresh        # gets a fresh address when a signed one expires
         self._first_url = url
@@ -221,6 +239,10 @@ class HlsStream:
         self._first_info = self._info(first)
         head_start = sum(s.duration for s in start[:self._burst])
         self.description += f", {playlist.target:g}s segments, {head_start:.0f}s head start"
+        if self._as_mp4:
+            self.description += ", sent as MP4"
+        elif self._want_mp4:
+            self.note("MP4 output was asked for, but this station's segments are not MP4: sending AAC")
 
     async def _select(self, url: str, text: str) -> MediaPlaylist:
         """Settle on a media playlist (choosing a quality if given a master)."""
@@ -284,14 +306,19 @@ class HlsStream:
         data = await self._convert(segment)
         if not data:
             return
-        self.info = self._info(segment)
+        info = self.info = self._info(segment)
         now = time.monotonic()
         start = now if self._due is None else max(self._due, now - segment.duration)
         self._due = start + segment.duration
-        for offset_s, piece in _slices(data, SLICE_S):
+        if self._as_mp4:
+            pieces = _even_slices(data, self._audio_s or segment.duration, SLICE_S)
+        else:
+            pieces = ((offset_s, piece, None) for offset_s, piece in _slices(data, SLICE_S))
+        for offset_s, piece, piece_s in pieces:
             delay = start + offset_s - time.monotonic()
             if delay > 0:
                 await asyncio.sleep(delay)
+            self.info = replace(info, piece_s=piece_s)
             yield piece
 
     async def _reload(self) -> MediaPlaylist:
@@ -370,14 +397,25 @@ class HlsStream:
         try:
             if segment.map_url:
                 if segment.map_url != self._init_url:
-                    init = mp4.parse_init(await self._download(segment.map_url, renewable=False))
+                    init_raw = await self._download(segment.map_url, renewable=False)
+                    init = mp4.parse_init(init_raw)
                     if self._init is not None and init.config != self._init.config:
                         self.note(
                             f"station changed its audio description at segment {segment.seq}: "
                             f"{self._init.config} -> {init.config}"
                         )
+                    if self._init is None and self._want_mp4:
+                        self._as_mp4 = True
+                        self.content_type = "audio/mp4"
                     self._init = init
                     self._init_url = segment.map_url
+                    if self._as_mp4 and init_raw != self.capture_head:
+                        # The description goes out once, ahead of the first audio (and
+                        # again only if the station ever changes it).
+                        self.capture_head = init_raw
+                        return init_raw + self._mp4_audio(data)
+                if self._as_mp4:
+                    return self._mp4_audio(data)
                 return mp4.to_adts(data, self._init)
             if looks_like_ts(data):
                 return self._framer.feed(self._ts.feed(data))
@@ -385,8 +423,15 @@ class HlsStream:
         except (mp4.Mp4Error, TsError, AacError) as exc:
             raise HlsError(f"cannot read segment {segment.seq}: {exc}") from exc
 
+    def _mp4_audio(self, data: bytes) -> bytes:
+        """A segment's own moof+mdat pairs, timed from the start of this listener's stream."""
+        out, self._time_base, frames = mp4.fragments(data, self._time_base)
+        self._audio_s = frames * 1024 / self._init.config.sample_rate
+        return out
+
     def _info(self, segment: Segment) -> ChunkInfo:
-        return ChunkInfo(segment.seq, segment.duration, self._download_s, segment.program_time)
+        return ChunkInfo(segment.seq, segment.duration, self._download_s, segment.program_time,
+                         self._audio_s if self._as_mp4 else None)
 
     async def _download(self, url: str, *, renewable: bool = True) -> bytes:
         """Fetch one file, trying three times. A refusal of a signed address is

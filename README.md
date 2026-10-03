@@ -15,6 +15,7 @@ The station is in the address. Nothing else to configure.
 |---|---|
 | `/stream/<http or https>/<host>/<path>?<query>` | Any station address. Scheme first, then the station's own host, path and query, untouched. |
 | `/tunein/<station id>` | A TuneIn station, e.g. `/tunein/s345724`. Looked up fresh on every connect, and again whenever the signed address expires. |
+| either of the above, with `out=mp4` | The same station sent as fragmented MP4 instead of plain AAC (see below). |
 | `/status` | Who is listening right now and how it is going (JSON). |
 | `/health` | Liveness check (used by the Docker healthcheck). |
 
@@ -22,7 +23,26 @@ The station is in the address. Nothing else to configure.
 http://pi:8010/tunein/s345724
 http://pi:8010/stream/https/stream.radiofrance.fr/fip/fip.m3u8?id=radiofrance
 http://pi:8010/stream/https/stream.radioparadise.com/aac-320
+http://pi:8010/tunein/s345724?out=mp4
 ```
+
+### MP4 output (`out=mp4`)
+
+Add `out=mp4` to the address (`?out=mp4`, or `&out=mp4` after a station's own
+query) and an HLS station whose segments are fragmented MP4 (Apple's are) is
+sent as one fragmented MP4 stream, `Content-Type: audio/mp4`, instead of ADTS.
+
+- The audio and its tables are the station's own, untouched: each segment's
+  `moof`+`mdat` pairs are passed on as they came, after the station's audio
+  description (sent once, first).
+- Dropped: the per-segment wrapping a player has no use for (`styp`, `sidx`, and
+  the `emsg` boxes Apple fills with titles and artwork).
+- Changed: one number per fragment, its start time, so the stream starts at 0
+  for each listener instead of wherever the station's clock is (hundreds of days in).
+
+Unlike ADTS, MP4 carries timestamps, so a player does not have to keep time by
+counting frames. A station that is not fragmented MP4 (MPEG-TS, a plain stream)
+is sent as usual and the log says so; `out=mp4` is ours and is not passed to the station.
 
 ## What it does with a station
 
@@ -97,8 +117,11 @@ For each listener radioproxy keeps the last five minutes of audio exactly as
 sent. When the listener leaves, it writes two files to `/data` (the newest 12
 are kept):
 
-- `<time>-<station>.aac`: that audio. Decode it to see whether the data was
-  sound: `ffmpeg -v error -i <file> -f null -` prints nothing for clean audio.
+- `<time>-<station>.aac` (`.mp4` for MP4 output): that audio. Decode it to see
+  whether the data was sound: `ffmpeg -v error -i <file> -f null -` prints
+  nothing for clean audio. An MP4 capture starts at the first whole fragment
+  kept and ends where the listener left, usually part-way through a fragment,
+  so ffmpeg reports `partial file` for the very end; anything earlier is real.
 - `<time>-<station>.txt`: a report. When it connected and left and why, how
   much audio was sent, roughly how much the player was holding, and a timeline
   of each segment: when it was sent, how long it took to download, the
@@ -117,7 +140,7 @@ that far before the end of the audio file.
 | `radioproxy/__main__.py` | The HTTP server and address parsing |
 | `radioproxy/sources.py` | Works out what an address is; TuneIn lookup; pass-through |
 | `radioproxy/hls.py` | HLS client: playlists, quality choice, segment loop |
-| `radioproxy/mp4.py` | Fragmented MP4 to raw AAC frames |
+| `radioproxy/mp4.py` | Fragmented MP4 to raw AAC frames, or to a continuous MP4 stream |
 | `radioproxy/ts.py` | MPEG-TS to the AAC stream |
 | `radioproxy/adts.py` | ADTS headers and whole-frame output |
 | `radioproxy/listener.py` | Per-listener capture, timeline, connection readings, report |

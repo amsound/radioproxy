@@ -28,7 +28,10 @@ CAPTURE_MAX_BYTES = 32 * 1024 * 1024
 KEEP_CAPTURES = 12                # oldest captures are deleted beyond this
 ROW_EVERY_S = 10.0                # timeline rows for a continuous (non-HLS) stream
 _AAC_TYPES = ("audio/aac", "audio/aacp")
-_EXTENSIONS = {"audio/aac": "aac", "audio/aacp": "aac", "audio/mpeg": "mp3", "audio/ogg": "ogg", "audio/flac": "flac"}
+_EXTENSIONS = {
+    "audio/aac": "aac", "audio/aacp": "aac", "audio/mp4": "mp4",
+    "audio/mpeg": "mp3", "audio/ogg": "ogg", "audio/flac": "flac",
+}
 
 
 def _clock(t: float) -> str:
@@ -56,11 +59,13 @@ class Listener:
         self.peer = peer
         self.description = stream.description
         self.content_type = stream.content_type
+        self._stream = stream
         self._sock = sock
         self.started = time.time()
         self._started_mono = time.monotonic()
         self.sent = 0
-        self.audio_s: float | None = 0.0 if self.content_type in _AAC_TYPES else None
+        # Audio is counted from the ADTS frames themselves, or (MP4) as the stream reports it.
+        self.audio_s: float | None = 0.0 if self.content_type in (*_AAC_TYPES, "audio/mp4") else None
         self.blocked_s = 0.0
         self._counter = AdtsFramer() if self.content_type in _AAC_TYPES else None
         self._format: tuple[int, int, int] | None = None
@@ -92,6 +97,9 @@ class Listener:
             if self._format:
                 audio_s = frames * 1024 / self._format[1]
                 self.audio_s += audio_s
+        elif self.audio_s is not None and info.piece_s is not None:
+            audio_s = info.piece_s
+            self.audio_s += audio_s
 
         self._audio.append((time.monotonic(), data))
         self._audio_bytes += len(data)
@@ -190,7 +198,7 @@ class Listener:
             base = os.path.join(DATA_DIR, f"{stamp}-{self.station}")
             audio_path = f"{base}.{_EXTENSIONS.get(self.content_type, 'bin')}"
             with open(audio_path, "wb") as f:
-                for _, data in self._audio:
+                for data in self._playable():
                     f.write(data)
             with open(f"{base}.txt", "w", encoding="utf-8") as f:
                 f.write(self._report(reason, os.path.basename(audio_path)))
@@ -199,6 +207,21 @@ class Listener:
         except OSError as exc:
             logger.info("%s capture not saved (%s)", self.label, exc)
             return None
+
+    def _playable(self) -> list[bytes]:
+        """The kept audio in a form a player can open.
+
+        ADTS can be cut anywhere. MP4 cannot: the kept pieces usually begin
+        part-way through a fragment, so those are dropped up to the next
+        fragment, and the stream's description is put in front.
+        """
+        pieces = [data for _, data in self._audio]
+        if self.content_type != "audio/mp4" or not pieces or pieces[0][4:8] == b"ftyp":
+            return pieces
+        for i, data in enumerate(pieces):
+            if data[4:8] == b"moof":
+                return [self._stream.capture_head, *pieces[i:]]
+        return pieces
 
     def _report(self, reason: str, audio_name: str) -> str:
         if self._pending_row is not None:

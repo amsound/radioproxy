@@ -2,6 +2,7 @@
 
   GET /stream/<http|https>/<host>/<path>?<query>   any station address
   GET /tunein/<station id>                          TuneIn station, e.g. /tunein/s345724
+  ...?out=mp4                                       on either: send an fMP4 station as MP4 instead of AAC
   GET /status                                       who is listening and how it is going (JSON)
   GET /health
 
@@ -52,15 +53,23 @@ async def _reply(writer: asyncio.StreamWriter, status: str, body: str, ctype: st
     await writer.drain()
 
 
-def _station(target: str) -> tuple[str, str | None, str] | None:
-    """(label, tunein id or None, address) for a request target, or None if it isn't a stream."""
+def _station(target: str) -> tuple[str, str | None, str, str] | None:
+    """(label, tunein id or None, address, output) for a request target, or None if it isn't a stream.
+
+    output is "mp4" if the request carries out=mp4, else "adts". That one
+    parameter is ours; the rest of the query belongs to the station and is
+    passed on untouched.
+    """
     path, _, query = target.partition("?")
+    pairs = query.split("&") if query else []
+    output = "mp4" if "out=mp4" in pairs else "adts"
+    query = "&".join(pair for pair in pairs if pair != "out=mp4")
     parts = path.split("/", 3)
     if len(parts) == 3 and parts[1] == "tunein" and TUNEIN_ID_RE.match(parts[2].lower()):
-        return parts[2].lower(), parts[2].lower(), ""
+        return parts[2].lower(), parts[2].lower(), "", output
     if len(parts) == 4 and parts[1] == "stream" and parts[2] in ("http", "https") and parts[3]:
         address = f"{parts[2]}://{parts[3]}" + (f"?{query}" if query else "")
-        return parts[3].split("/", 1)[0], None, address
+        return parts[3].split("/", 1)[0], None, address, output
     return None
 
 
@@ -100,9 +109,9 @@ class Server:
         if station is None:
             return await _reply(
                 writer, "404 Not Found",
-                "use /stream/<http|https>/<host>/<path>?<query> or /tunein/<station id>",
+                "use /stream/<http|https>/<host>/<path>?<query> or /tunein/<station id> (add out=mp4 for MP4)",
             )
-        name, tunein_id, address = station
+        name, tunein_id, address, output = station
         peer = (writer.get_extra_info("peername") or ("?",))[0]
         label = f"[{name} #{next(_request_ids)} <- {peer}]"
 
@@ -111,12 +120,14 @@ class Server:
 
         async def open_station():
             if not tunein_id:
-                return await open_source(self._session, address, label)
+                return await open_source(self._session, address, label, output=output)
             try:
-                return await open_source(self._session, await tunein_address(self._session, tunein_id), label, renew)
+                return await open_source(
+                    self._session, await tunein_address(self._session, tunein_id), label, renew, output=output
+                )
             except Exception:
                 # A reused address may have gone stale: look it up again once.
-                return await open_source(self._session, await renew(), label, renew)
+                return await open_source(self._session, await renew(), label, renew, output=output)
 
         try:
             stream = await asyncio.wait_for(open_station(), OPEN_TIMEOUT_S)

@@ -169,6 +169,49 @@ def frames(segment: bytes, init: Init) -> Iterator[bytes]:
             pending = []
 
 
+def fragments(segment: bytes, time_base: int | None) -> tuple[bytes, int | None, int]:
+    """An fMP4 media segment reduced to its audio: each moof+mdat pair, as it came.
+
+    The wrapping a player has no use for is dropped (styp, sidx, and the emsg
+    boxes Apple fills with track artwork and titles). The audio and its tables
+    are untouched except for one number: the fragment's start time, which is
+    shifted by time_base so that a listener's stream begins at zero instead of
+    wherever the station's clock happens to be (hundreds of days in).
+
+    Returns (bytes, time_base, frames). Pass time_base=None for a listener's
+    first segment: its start time becomes the base, and is returned.
+    """
+    out = bytearray()
+    count = 0
+    box_start = 0
+    for kind, p, e in boxes(segment):
+        begins, box_start = box_start, e
+        if kind == b"mdat":
+            out += segment[begins:e]
+            continue
+        if kind != b"moof":
+            continue
+        start = len(out)
+        out += segment[begins:e]
+        traf = _find(segment, (b"traf",), p, e)
+        if not traf:
+            continue
+        for tkind, tp, te in boxes(segment, *traf):
+            if tkind == b"tfdt":
+                fmt = ">Q" if segment[tp] == 1 else ">I"
+                when = struct.unpack_from(fmt, segment, tp + 4)[0]
+                if time_base is None:
+                    time_base = when
+                if when < time_base:
+                    raise Mp4Error("fragment start time runs backwards")
+                struct.pack_into(fmt, out, start + (tp + 4) - begins, when - time_base)
+            elif tkind == b"trun":
+                count += struct.unpack_from(">I", segment, tp + 4)[0]
+    if not out:
+        raise Mp4Error("segment has no audio fragments")
+    return bytes(out), time_base, count
+
+
 def to_adts(segment: bytes, init: Init) -> bytes:
     """An fMP4 media segment as ADTS: every frame, each with its 7-byte header."""
     out = bytearray()

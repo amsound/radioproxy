@@ -61,11 +61,18 @@ AAC, transcoding.
 
 ## Behaviour
 
-- **Head start.** An HLS listener starts three segments back from live, as the
-  HLS spec asks of players, and receives those at once: about 12 s of audio on
-  4 s segments, about 48 s on Apple's 16 s ones. After that each segment is
-  passed on the moment it is downloaded. It follows the station; there is no
-  setting.
+- **Head start.** An HLS listener is sent a head start at once, and everything
+  after it at real time in half-second slices. By default the head start is
+  three segments, as the HLS spec asks players to hold: about 12 s of audio on
+  4 s segments, about 48 s on Apple's 16 s ones. `BURST_SECONDS` makes it that
+  many seconds instead. It is the same setting, with the same meaning, as the
+  restreamer's.
+- **Reserve.** A listener joins two segments further back than its head start,
+  and those two are not sent at once. Radioproxy therefore always has audio in
+  hand, and the connection is never silent while the station gets round to
+  publishing its next segment (some players hang up on a silent connection).
+  So a listener joins five segments back from live by default, and three on
+  Apple's station with `BURST_SECONDS=15`, which is where the restreamer joins.
 - **Signed addresses.** When a TuneIn address expires mid-stream, radioproxy
   fetches a new one and carries on in the same response, from the next segment.
 - **Whole frames only.** The listener never receives part of an AAC frame.
@@ -83,12 +90,17 @@ services:
     init: true
     ports:
       - "8010:8010"
+    environment:
+      BURST_SECONDS: "90"                # optional: see Head start
     volumes:
       - ./radioproxy-data:/data
     restart: unless-stopped
 ```
 
-`PORT` (default `8010`) is the only setting. The data folder must be writable by the container's user
+Settings: `PORT` (default `8010`), and `BURST_SECONDS` (unset: a head start of three segments).
+A small `BURST_SECONDS` leaves less margin at Apple's six-hourly re-signing, when
+nothing can be sent for a few seconds (about 10 when measured) and the listener
+plays from its head start. The data folder must be writable by the container's user
 (`sudo chown 10001:10001 radioproxy-data`); without it radioproxy runs the same, just without captures.
 
 GitHub Actions (`.github/workflows/image.yml`) builds the arm64 image on every

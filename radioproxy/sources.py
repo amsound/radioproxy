@@ -115,6 +115,7 @@ async def open_source(
     refresh: Callable[[], Awaitable[str]] | None = None,
     depth: int = 0,
     output: str = "adts",
+    burst_s: float | None = None,
 ):
     """Open url as a stream object: .content_type, .description, .chunks(), .close()."""
     resp = await session.get(url, timeout=STREAM_TIMEOUT)
@@ -136,7 +137,7 @@ async def open_source(
     resp.close()
 
     if "#EXT-X-" in text:
-        stream = HlsStream(session, final_url, text, label, refresh, output)
+        stream = HlsStream(session, final_url, text, label, refresh, output, burst_s)
         await stream.open()
         return stream
 
@@ -149,7 +150,7 @@ async def open_source(
     last: Exception | None = None
     for entry in entries:
         try:
-            return await open_source(session, entry, label, None, depth + 1, output)
+            return await open_source(session, entry, label, None, depth + 1, output, burst_s)
         except Exception as exc:  # try the next alternative
             last = exc
             logger.info("%s playlist entry failed (%s): %s", label, exc, entry)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import re
 import time
 from dataclasses import dataclass, replace
@@ -19,18 +20,24 @@ from .ts import TsDemuxer, TsError, looks_like_ts
 
 logger = logging.getLogger("radioproxy")
 
-# Start up to this many segments back from live (fewer on a short playlist).
+# Where a listener joins, and how much it is sent at once.
 #
-# The first ones are sent at once: the listener's head start. Three segments
-# where the playlist allows, as the HLS spec asks players to hold: ~12 s on 4 s
-# segments, ~48 s on Apple's 16 s ones.
+# The head start goes out at once. By default it is three segments, as the HLS
+# spec asks players to hold: ~12 s on 4 s segments, ~48 s on Apple's 16 s ones.
+# BURST_SECONDS (see __main__) makes it a number of seconds instead, the same
+# setting and meaning as the restreamer's.
 #
-# The last RESERVE_SEGMENTS are not: from there on audio is fed out at real time
-# in small slices, so radioproxy always has a segment in hand and the connection
-# is never silent while the station gets round to publishing its next one. A
-# silent connection makes some players hang up (Audio Pro/LinkPlay: after 15 s,
-# and Apple publishes 16 s segments, irregularly).
-START_SEGMENTS_BACK = 5
+# Behind the head start come RESERVE_SEGMENTS more that are not sent at once:
+# from there on audio is fed out at real time in small slices, so radioproxy
+# always has a segment in hand and the connection is never silent while the
+# station gets round to publishing its next one. A silent connection makes some
+# players hang up (Audio Pro/LinkPlay: after 15 s, and Apple publishes 16 s
+# segments, irregularly).
+#
+# So a listener joins (head start + reserve) back from live: five segments by
+# default; three on Apple with BURST_SECONDS=15, which is where ffmpeg (and so
+# the restreamer) joins.
+HEAD_START_SEGMENTS = 3
 RESERVE_SEGMENTS = 2
 SLICE_S = 0.5
 RELOAD_S = 1.0   # how often to look for the next segment once the current one is sent
@@ -39,7 +46,9 @@ GIVE_UP_AFTER_S = 60.0
 # After a new address, how long to keep asking for a playlist whose segments are
 # signed afresh. Apple's segment signatures all run out together on a six-hourly
 # boundary, and for a few seconds after it the playlists it serves still carry
-# the old ones. Shorter than the listener's head start, so it never hears a gap.
+# the old ones (about 10 s when measured). Nothing can be sent meanwhile, so the
+# listener plays from its head start: the default covers the whole wait, a
+# BURST_SECONDS below it does not.
 RESIGN_WAIT_S = 30.0
 RESIGN_POLL_S = 2.0
 
@@ -196,8 +205,11 @@ class HlsStream:
         label: str,
         refresh: Callable[[], Awaitable[str]] | None = None,
         output: str = "adts",
+        burst_s: float | None = None,
     ) -> None:
         self._session = session
+        self._burst_s = burst_s          # seconds to send at once; None for the default three segments
+        self._head_s = 0.0               # what that comes to on this station's playlist
         self._want_mp4 = output == "mp4"
         self._as_mp4 = False             # settled by the first segment: only an fMP4 station can be sent as MP4
         self._time_base: int | None = None
@@ -227,18 +239,23 @@ class HlsStream:
         playlist = await self._select(self._first_url, self._first_text)
         if not playlist.segments:
             raise HlsError("playlist has no segments")
-        back = min(START_SEGMENTS_BACK, max(1, len(playlist.segments) - 1))
+        if self._burst_s is None:
+            head_segments = HEAD_START_SEGMENTS
+        else:
+            head_segments = max(1, math.ceil(self._burst_s / playlist.target))
+        back = min(head_segments + RESERVE_SEGMENTS, max(1, len(playlist.segments) - 1))
         start = playlist.segments[-back:]
-        self._burst = max(1, len(start) - RESERVE_SEGMENTS)
+        # Never dip into the reserve for the head start (a short playlist may not hold both).
+        spare = sum(s.duration for s in start[:max(1, len(start) - RESERVE_SEGMENTS)])
+        self._head_s = spare if self._burst_s is None else min(self._burst_s, spare)
         self._next_seq = start[0].seq
         self._pending = list(start)
         # Convert the first segment now, so a stream we can't handle fails before
         # the listener is told "200 OK".
-        first = self._pending.pop(0)
-        self._first = await self._convert(first)
-        self._first_info = self._info(first)
-        head_start = sum(s.duration for s in start[:self._burst])
-        self.description += f", {playlist.target:g}s segments, {head_start:.0f}s head start"
+        self._first_segment = self._pending.pop(0)
+        self._first = await self._convert(self._first_segment)
+        self._first_info = self._info(self._first_segment)
+        self.description += f", {playlist.target:g}s segments, {self._head_s:.0f}s head start"
         if self._as_mp4:
             self.description += ", sent as MP4"
         elif self._want_mp4:
@@ -258,18 +275,25 @@ class HlsStream:
         return playlist
 
     async def chunks(self) -> AsyncIterator[bytes]:
-        self.info = self._first_info
-        yield self._first
-        self._first = b""
-        burst = self._burst - 1   # the first segment has just gone
-        for segment in self._pending[:burst]:
-            data = await self._convert(segment)
-            self.info = self._info(segment)
-            yield data
-        for segment in self._pending[burst:]:
-            async for piece in self._paced(segment):
-                yield piece
-        self._pending = []
+        # The head start goes out at once: whole segments while it covers them,
+        # then the first part of the next one. From there on, real time.
+        left = self._head_s
+        queue: list[tuple[Segment, bytes | None]] = [(self._first_segment, self._first)]
+        queue += [(segment, None) for segment in self._pending]
+        self._first, self._pending = b"", []
+        for segment, data in queue:
+            if left >= segment.duration - 1e-6:
+                if data is None:
+                    data = await self._convert(segment)
+                    self.info = self._info(segment)
+                else:
+                    self.info = self._first_info
+                left -= segment.duration
+                yield data
+            else:
+                async for piece in self._paced(segment, data, ahead_s=max(0.0, left)):
+                    yield piece
+                left = 0.0
 
         failing_since: float | None = None
         while True:
@@ -296,19 +320,27 @@ class HlsStream:
             if not new:
                 await asyncio.sleep(RELOAD_S)
 
-    async def _paced(self, segment: Segment) -> AsyncIterator[bytes]:
+    async def _paced(
+        self, segment: Segment, data: bytes | None = None, ahead_s: float = 0.0
+    ) -> AsyncIterator[bytes]:
         """One segment's audio, released at real time against a running schedule.
 
         The schedule is absolute, so time spent downloading or waiting for the
         station is made up rather than accumulating. A segment that is already
         more than its own length late is sent at once.
+
+        data is given for the first segment, which open() has already converted.
+        ahead_s starts the schedule that far in the past, so that much of the
+        segment goes out at once: the end of the listener's head start.
         """
-        data = await self._convert(segment)
+        first = data is not None
+        if not first:
+            data = await self._convert(segment)
         if not data:
             return
-        info = self.info = self._info(segment)
+        info = self.info = self._first_info if first else self._info(segment)
         now = time.monotonic()
-        start = now if self._due is None else max(self._due, now - segment.duration)
+        start = now - ahead_s if self._due is None else max(self._due, now - segment.duration)
         self._due = start + segment.duration
         if self._as_mp4:
             pieces = _even_slices(data, self._audio_s or segment.duration, SLICE_S)

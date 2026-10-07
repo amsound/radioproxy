@@ -24,16 +24,37 @@ import time
 
 import aiohttp
 
+from .hls import HEAD_START_SEGMENTS, RESERVE_SEGMENTS
 from .http import USER_AGENT
-from .listener import Listener
+from .listener import DATA_DIR, Listener
 from .sources import TUNEIN_ID_RE, open_source, tunein_address
 
 logger = logging.getLogger("radioproxy")
 
 PORT = int(os.environ.get("PORT", "8010"))
+
+
+def _burst_seconds() -> float | None:
+    """BURST_SECONDS: seconds of an HLS station sent at once on connect, then real time.
+
+    The same setting, with the same meaning, as the restreamer's. Unset (or not
+    a number) leaves the default of three segments.
+    """
+    raw = os.environ.get("BURST_SECONDS", "").strip()
+    if not raw:
+        return None
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        logger.warning("BURST_SECONDS=%r is not a number; using the default head start", raw)
+        return None
+
+
+BURST_S = _burst_seconds()
 REQUEST_TIMEOUT_S = 10.0
 OPEN_TIMEOUT_S = 30.0
 _request_ids = itertools.count(1)
+_STARTED = time.monotonic()
 
 
 def _build_date() -> str:
@@ -102,7 +123,19 @@ class Server:
         if target.split("?", 1)[0] == "/health":
             return await _reply(writer, "200 OK", "ok")
         if target.split("?", 1)[0] == "/status":
-            body = json.dumps({"listeners": [x.status() for x in self._listeners.values()]}, indent=2)
+            # The top-level fields match the restreamer's /status, so one look says what each is running.
+            body = json.dumps(
+                {
+                    "service": "radioproxy",
+                    "built": _build_date(),
+                    "uptime_s": round(time.monotonic() - _STARTED),
+                    "burst_s": BURST_S,   # null: the default, HEAD_START_SEGMENTS segments
+                    "hls_reserve_segments": RESERVE_SEGMENTS,
+                    "captures": DATA_DIR,
+                    "listeners": [x.status() for x in self._listeners.values()],
+                },
+                indent=2,
+            )
             return await _reply(writer, "200 OK", body, "application/json")
 
         station = _station(target)
@@ -120,14 +153,15 @@ class Server:
 
         async def open_station():
             if not tunein_id:
-                return await open_source(self._session, address, label, output=output)
+                return await open_source(self._session, address, label, output=output, burst_s=BURST_S)
             try:
                 return await open_source(
-                    self._session, await tunein_address(self._session, tunein_id), label, renew, output=output
+                    self._session, await tunein_address(self._session, tunein_id), label, renew,
+                    output=output, burst_s=BURST_S,
                 )
             except Exception:
                 # A reused address may have gone stale: look it up again once.
-                return await open_source(self._session, await renew(), label, renew, output=output)
+                return await open_source(self._session, await renew(), label, renew, output=output, burst_s=BURST_S)
 
         try:
             stream = await asyncio.wait_for(open_station(), OPEN_TIMEOUT_S)
@@ -190,7 +224,9 @@ class Server:
         )
         server = await asyncio.start_server(self.handle, "0.0.0.0", PORT, limit=64 * 1024)
         logger.info(
-            "listening on :%d (built %s, python %s)", PORT, _build_date(), sys.version.split()[0]
+            "listening on :%d (built %s, python %s, HLS head start %s then real time)",
+            PORT, _build_date(), sys.version.split()[0],
+            f"{HEAD_START_SEGMENTS} segments" if BURST_S is None else f"{BURST_S:g}s",
         )
         stop = asyncio.Event()
         loop = asyncio.get_running_loop()

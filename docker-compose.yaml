@@ -5,6 +5,8 @@ services:
     init: true
     ports:
       - "8010:8010"
+    environment:
+      BURST_SECONDS: "90"                # audio sent at once on connect, then real time (unset: three segments)
     volumes:
       - ./radioproxy-data:/data          # captures of what each listener was last sent
       - /etc/localtime:/etc/localtime:ro

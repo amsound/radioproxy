@@ -17,7 +17,7 @@ from urllib.parse import urljoin, urlsplit
 import aiohttp
 
 from .hls import ChunkInfo, HlsStream
-from .http import FETCH_TIMEOUT, HttpError
+from .http import FETCH_TIMEOUT, HttpError, why
 
 logger = logging.getLogger("radioproxy")
 
@@ -153,5 +153,5 @@ async def open_source(
             return await open_source(session, entry, label, None, depth + 1, output, burst_s)
         except Exception as exc:  # try the next alternative
             last = exc
-            logger.info("%s playlist entry failed (%s): %s", label, exc, entry)
-    raise SourceError(f"no playlist entry worked: {last}")
+            logger.info("%s playlist entry failed (%s): %s", label, why(exc), entry.split("?", 1)[0])
+    raise SourceError(f"no playlist entry worked: {why(last)}")

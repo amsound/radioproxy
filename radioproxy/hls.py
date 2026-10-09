@@ -15,7 +15,7 @@ import aiohttp
 
 from . import mp4
 from .adts import SAMPLE_RATES, AacError, AdtsFramer, frame_len, strip_id3
-from .http import HttpError, fetch
+from .http import PLAYLIST_TIMEOUT, HttpError, fetch, why
 from .ts import TsDemuxer, TsError, looks_like_ts
 
 logger = logging.getLogger("radioproxy")
@@ -302,7 +302,11 @@ class HlsStream:
                 async for piece in self._paced(segment, data, info, ahead_s=max(0.0, left)):
                     yield piece
                 left = 0.0
+            waiting = time.monotonic()
             item = await self._ahead.get()
+            waited = time.monotonic() - waiting
+            if left <= 0 and waited >= 1.0:
+                self.note(f"nothing to send for {waited:.1f}s: the read-ahead had run out")
             if item is None:
                 return
             if isinstance(item, Exception):
@@ -329,15 +333,19 @@ class HlsStream:
             while True:
                 try:
                     playlist = await self._reload()
-                    failing_since = None
                 except (HttpError, aiohttp.ClientError, asyncio.TimeoutError, HlsError) as exc:
                     now = time.monotonic()
-                    failing_since = failing_since or now
-                    if now - failing_since > GIVE_UP_AFTER_S:
-                        raise HlsError(f"playlist unavailable for {GIVE_UP_AFTER_S:g}s: {exc}") from exc
-                    self.note(f"playlist reload failed ({exc}); retrying")
+                    if failing_since is None:
+                        # Said once, and again when it is over: the listener is still being sent what was read ahead.
+                        failing_since = now
+                        self.note(f"station's playlist could not be read ({why(exc)}); {self._in_hand()}, retrying")
+                    elif now - failing_since > GIVE_UP_AFTER_S:
+                        raise HlsError(f"station's playlist unreadable for {GIVE_UP_AFTER_S:g}s: {why(exc)}") from exc
                     await asyncio.sleep(2.0)
                     continue
+                if failing_since is not None:
+                    self.note(f"station's playlist readable again after {time.monotonic() - failing_since:.0f}s; {self._in_hand()}")
+                    failing_since = None
 
                 new = [s for s in playlist.segments if s.seq >= self._fetch_seq]
                 if playlist.segments and playlist.segments[0].seq > self._fetch_seq:
@@ -353,6 +361,15 @@ class HlsStream:
             raise
         except Exception as exc:
             await self._ahead.put(exc)
+
+    def _in_hand(self) -> str:
+        """How much audio is downloaded and still to be sent, for a log line."""
+        queued = self._ahead.qsize() if self._ahead is not None else 0
+        current = max(0.0, self._due - time.monotonic()) if self._due is not None else 0.0
+        seconds = current + queued * self._target
+        if seconds < 1.0:
+            return "no audio left in hand"
+        return f"{seconds:.0f}s of audio in hand"
 
     async def _paced(
         self, segment: Segment, data: bytes, info: ChunkInfo, ahead_s: float = 0.0
@@ -385,7 +402,7 @@ class HlsStream:
 
     async def _reload(self) -> MediaPlaylist:
         try:
-            _, text = await fetch(self._session, self._media_url, text=True)
+            _, text = await fetch(self._session, self._media_url, text=True, timeout=PLAYLIST_TIMEOUT)
         except HttpError as exc:
             if self._refresh is None or not _refused(exc.status):
                 raise
@@ -404,7 +421,7 @@ class HlsStream:
         try:
             playlist = await self._renew(refused.status)
         except (HttpError, aiohttp.ClientError, asyncio.TimeoutError) as exc:
-            raise HlsError(f"segment download failed: {refused}; no new address: {exc}") from exc
+            raise HlsError(f"segment download failed: {why(refused)}; no new address: {why(exc)}") from exc
         tries = 0
         while True:
             current = next((s for s in playlist.segments if s.seq >= segment.seq), None)
@@ -420,7 +437,7 @@ class HlsStream:
             else:
                 last = HlsError(f"segment {segment.seq} no longer listed")
             if time.monotonic() + RESIGN_POLL_S > give_up:
-                raise HlsError(f"segment download failed for {RESIGN_WAIT_S:g}s after a new address: {last}")
+                raise HlsError(f"segment download failed for {RESIGN_WAIT_S:g}s after a new address: {why(last)}")
             await asyncio.sleep(RESIGN_POLL_S)
             tries += 1
             try:
@@ -520,7 +537,7 @@ class HlsStream:
                     raise
                 last = exc
                 await asyncio.sleep(0.5 * (attempt + 1))
-        raise HlsError(f"segment download failed: {last}")
+        raise HlsError(f"segment download failed: {why(last)}")
 
     async def close(self) -> None:
         reader, self._reader = self._reader, None

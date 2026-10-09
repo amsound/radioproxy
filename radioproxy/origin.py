@@ -29,7 +29,7 @@ from urllib.parse import urljoin, urlsplit
 import aiohttp
 
 from .hls import HlsError, _refused, is_master, parse_master, parse_media, pick_variant
-from .http import HttpError, fetch
+from .http import HttpError, fetch, why
 from .sources import tunein_address
 
 logger = logging.getLogger("radioproxy")
@@ -171,8 +171,7 @@ class HlsOrigin:
         now = time.monotonic()
         if self._unread_since is None:
             self._unread_since = now
-            logger.warning("%s station could not be read (%s); handing out what is in hand", self.label,
-                           f"HTTP {exc.status}" if isinstance(exc, HttpError) else exc or type(exc).__name__)
+            logger.warning("%s station could not be read (%s); handing out what is in hand", self.label, why(exc))
 
     async def _look_up(self, seen: int, *, fresh: bool) -> None:
         """Ask TuneIn where the station is (unless another task just did)."""

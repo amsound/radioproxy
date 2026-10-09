@@ -25,7 +25,7 @@ import time
 import aiohttp
 
 from .hls import HEAD_START_SEGMENTS, RESERVE_SEGMENTS
-from .http import USER_AGENT
+from .http import USER_AGENT, why
 from .listener import DATA_DIR, Listener
 from .origin import PLAYLIST_TYPE, HlsOrigin, segment_type
 from .sources import TUNEIN_ID_RE, open_source, tunein_address
@@ -200,8 +200,8 @@ class Server:
         try:
             stream = await asyncio.wait_for(open_station(), OPEN_TIMEOUT_S)
         except Exception as exc:
-            logger.warning("%s could not open: %s", label, exc or type(exc).__name__)
-            return await _reply(writer, "502 Bad Gateway", f"could not open station: {exc or type(exc).__name__}")
+            logger.warning("%s could not open: %s", label, why(exc))
+            return await _reply(writer, "502 Bad Gateway", f"could not open station: {why(exc)}")
 
         listener = Listener(label, name, peer, stream, writer.get_extra_info("socket"))
         stream.note = listener.note
@@ -231,7 +231,7 @@ class Server:
         except (ConnectionError, asyncio.CancelledError):
             pass
         except Exception as exc:
-            reason = f"stream failed: {exc}"
+            reason = f"stream failed: {why(exc)}"
             listener.note(reason)
         finally:
             self._listeners.pop(id(listener), None)
@@ -262,7 +262,7 @@ class Server:
                 return await _reply_bytes(writer, await origin.playlist(peer), PLAYLIST_TYPE, head_only=method == "HEAD")
             data = await origin.segment(name, peer)
         except Exception as exc:
-            logger.warning("%s %s failed: %s", origin.label, name or "playlist", exc or type(exc).__name__)
+            logger.warning("%s %s failed: %s", origin.label, name or "playlist", why(exc))
             return await _reply(writer, "502 Bad Gateway", "the station could not be reached")
         if data is None:
             return await _reply(writer, "404 Not Found", "the station no longer has this segment")

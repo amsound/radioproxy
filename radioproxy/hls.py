@@ -34,11 +34,17 @@ logger = logging.getLogger("radioproxy")
 # players hang up (Audio Pro/LinkPlay: after 15 s, and Apple publishes 16 s
 # segments, irregularly).
 #
+# Those segments are downloaded as soon as the station lists them, not when
+# their turn comes (see HlsStream._read_ahead), so the reserve is audio already
+# in memory: a slow download, or a signed station refusing addresses for a while
+# after it re-signs, costs the listener nothing until the reserve is used up.
+#
 # So a listener joins (head start + reserve) back from live: five segments by
 # default; three on Apple with BURST_SECONDS=15, which is where ffmpeg (and so
 # the restreamer) joins.
 HEAD_START_SEGMENTS = 3
 RESERVE_SEGMENTS = 2
+READ_AHEAD_SEGMENTS = 3   # most that wait in memory, downloaded but not yet due (plus one being fetched)
 SLICE_S = 0.5
 RELOAD_S = 1.0   # how often to look for the next segment once the current one is sent
 # A live playlist that stays broken this long ends the stream.
@@ -46,9 +52,8 @@ GIVE_UP_AFTER_S = 60.0
 # After a new address, how long to keep asking for a playlist whose segments are
 # signed afresh. Apple's segment signatures all run out together on a six-hourly
 # boundary, and for a few seconds after it the playlists it serves still carry
-# the old ones (about 10 s when measured). Nothing can be sent meanwhile, so the
-# listener plays from its head start: the default covers the whole wait, a
-# BURST_SECONDS below it does not.
+# the old ones (6 to 15 s when measured). Only the segment being read ahead waits
+# for this; the ones already in memory keep going out.
 RESIGN_WAIT_S = 30.0
 RESIGN_POLL_S = 2.0
 
@@ -229,6 +234,9 @@ class HlsStream:
         self._framer = AdtsFramer()
         self._download_s = 0.0
         self._renewed: dict[int, Segment] = {}   # segments as listed under the newest signed address
+        self._fetch_seq = 0              # the next segment the read-ahead will download
+        self._ahead: asyncio.Queue | None = None   # downloaded segments waiting their turn, in order
+        self._reader: asyncio.Task | None = None
         self._due: float | None = None   # when the next paced segment's audio is due to start going out
         self.description = ""
         self.info = ChunkInfo()
@@ -275,70 +283,92 @@ class HlsStream:
         return playlist
 
     async def chunks(self) -> AsyncIterator[bytes]:
+        self._ahead = asyncio.Queue(READ_AHEAD_SEGMENTS)
+        self._fetch_seq = self._first_segment.seq + 1
+        self._reader = asyncio.ensure_future(self._read_ahead(self._pending))
+        self._pending = []
+
         # The head start goes out at once: whole segments while it covers them,
         # then the first part of the next one. From there on, real time.
         left = self._head_s
-        queue: list[tuple[Segment, bytes | None]] = [(self._first_segment, self._first)]
-        queue += [(segment, None) for segment in self._pending]
-        self._first, self._pending = b"", []
-        for segment, data in queue:
+        segment, data, info = self._first_segment, self._first, self._first_info
+        self._first = b""
+        while True:
             if left >= segment.duration - 1e-6:
-                if data is None:
-                    data = await self._convert(segment)
-                    self.info = self._info(segment)
-                else:
-                    self.info = self._first_info
+                self.info = info
                 left -= segment.duration
                 yield data
             else:
-                async for piece in self._paced(segment, data, ahead_s=max(0.0, left)):
+                async for piece in self._paced(segment, data, info, ahead_s=max(0.0, left)):
                     yield piece
                 left = 0.0
-
-        failing_since: float | None = None
-        while True:
-            try:
-                playlist = await self._reload()
-                failing_since = None
-            except (HttpError, aiohttp.ClientError, asyncio.TimeoutError, HlsError) as exc:
-                now = time.monotonic()
-                failing_since = failing_since or now
-                if now - failing_since > GIVE_UP_AFTER_S:
-                    raise HlsError(f"playlist unavailable for {GIVE_UP_AFTER_S:g}s: {exc}") from exc
-                self.note(f"playlist reload failed ({exc}); retrying")
-                await asyncio.sleep(2.0)
-                continue
-
-            new = [s for s in playlist.segments if s.seq >= self._next_seq]
-            if playlist.segments and playlist.segments[0].seq > self._next_seq:
-                self.note(f"fell behind: skipped {playlist.segments[0].seq - self._next_seq} segments")
-            for segment in new:
-                async for piece in self._paced(segment):
-                    yield piece
-            if playlist.ended and not new:
+            item = await self._ahead.get()
+            if item is None:
                 return
-            if not new:
-                await asyncio.sleep(RELOAD_S)
+            if isinstance(item, Exception):
+                raise item
+            segment, raw, took = item
+            data = await self._decode(segment, raw, took)
+            info = self._info(segment)
+
+    async def _read_ahead(self, listed: list[Segment]) -> None:
+        """Download segments in order as the station lists them, ahead of their turn.
+
+        Runs beside chunks() for the life of the stream and hands over
+        (segment, its bytes as downloaded, seconds the download took) through a
+        short queue, so it stops when READ_AHEAD_SEGMENTS are waiting. After the
+        segments listed when the listener joined, the playlist is read again
+        before each download, so the address used is always the newest one.
+        A failure is handed over in the queue for chunks() to raise.
+        """
+        try:
+            for segment in listed:
+                if segment.seq >= self._fetch_seq:
+                    await self._ahead.put(await self._fetch(segment))
+            failing_since: float | None = None
+            while True:
+                try:
+                    playlist = await self._reload()
+                    failing_since = None
+                except (HttpError, aiohttp.ClientError, asyncio.TimeoutError, HlsError) as exc:
+                    now = time.monotonic()
+                    failing_since = failing_since or now
+                    if now - failing_since > GIVE_UP_AFTER_S:
+                        raise HlsError(f"playlist unavailable for {GIVE_UP_AFTER_S:g}s: {exc}") from exc
+                    self.note(f"playlist reload failed ({exc}); retrying")
+                    await asyncio.sleep(2.0)
+                    continue
+
+                new = [s for s in playlist.segments if s.seq >= self._fetch_seq]
+                if playlist.segments and playlist.segments[0].seq > self._fetch_seq:
+                    self.note(f"fell behind: skipped {playlist.segments[0].seq - self._fetch_seq} segments")
+                if new:
+                    await self._ahead.put(await self._fetch(new[0]))
+                elif playlist.ended:
+                    await self._ahead.put(None)
+                    return
+                else:
+                    await asyncio.sleep(RELOAD_S)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            await self._ahead.put(exc)
 
     async def _paced(
-        self, segment: Segment, data: bytes | None = None, ahead_s: float = 0.0
+        self, segment: Segment, data: bytes, info: ChunkInfo, ahead_s: float = 0.0
     ) -> AsyncIterator[bytes]:
         """One segment's audio, released at real time against a running schedule.
 
-        The schedule is absolute, so time spent downloading or waiting for the
-        station is made up rather than accumulating. A segment that is already
-        more than its own length late is sent at once.
+        The schedule is absolute, so time spent waiting for the station is made
+        up rather than accumulating. A segment that is already more than its own
+        length late is sent at once.
 
-        data is given for the first segment, which open() has already converted.
         ahead_s starts the schedule that far in the past, so that much of the
         segment goes out at once: the end of the listener's head start.
         """
-        first = data is not None
-        if not first:
-            data = await self._convert(segment)
         if not data:
             return
-        info = self.info = self._first_info if first else self._info(segment)
+        self.info = info
         now = time.monotonic()
         start = now - ahead_s if self._due is None else max(self._due, now - segment.duration)
         self._due = start + segment.duration
@@ -412,6 +442,10 @@ class HlsStream:
 
     async def _convert(self, segment: Segment) -> bytes:
         """Download one segment and return its audio as whole ADTS frames."""
+        return await self._decode(*await self._fetch(segment))
+
+    async def _fetch(self, segment: Segment) -> tuple[Segment, bytes, float]:
+        """Download one segment: (the segment as finally fetched, its bytes, seconds it took)."""
         started = time.monotonic()
         segment = self._renewed.get(segment.seq, segment)
         try:
@@ -420,15 +454,23 @@ class HlsStream:
             # The segment's own address was turned down: the playlist's signature has
             # run out. Take the same segment from a freshly signed playlist.
             segment, data = await self._resigned(segment, exc)
-        took = self._download_s = time.monotonic() - started
+        took = time.monotonic() - started
         if segment.duration and took > segment.duration:
             self.note(f"slow segment {segment.seq}: {took:.1f}s to download {segment.duration:.0f}s of audio")
+        self._fetch_seq = segment.seq + 1
+        return segment, data, took
+
+    async def _decode(self, segment: Segment, data: bytes, took: float) -> bytes:
+        """One downloaded segment's audio as whole ADTS frames. Segments must come in order."""
+        self._download_s = took
         if segment.discontinuity:
             self.note(f"station flagged a discontinuity before segment {segment.seq}")
         self._next_seq = segment.seq + 1
         try:
             if segment.map_url:
-                if segment.map_url != self._init_url:
+                # Compared without the query: a signed station re-signs the same
+                # description under a new address, and it need not be fetched again.
+                if segment.map_url.split("?", 1)[0] != (self._init_url or "").split("?", 1)[0]:
                     init_raw = await self._download(segment.map_url, renewable=False)
                     init = mp4.parse_init(init_raw)
                     if self._init is not None and init.config != self._init.config:
@@ -481,4 +523,7 @@ class HlsStream:
         raise HlsError(f"segment download failed: {last}")
 
     async def close(self) -> None:
-        pass
+        reader, self._reader = self._reader, None
+        if reader is not None:
+            reader.cancel()
+            await asyncio.gather(reader, return_exceptions=True)

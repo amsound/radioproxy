@@ -71,10 +71,15 @@ AAC, transcoding.
   and those two are not sent at once. Radioproxy therefore always has audio in
   hand, and the connection is never silent while the station gets round to
   publishing its next segment (some players hang up on a silent connection).
+- **Read-ahead.** The reserve is downloaded as soon as the station lists it, not
+  when its turn comes, so it is audio already in memory (up to three segments
+  per listener). A slow download, or a station refusing addresses for a while
+  after it re-signs, does not interrupt the listener unless it outlasts the reserve.
   So a listener joins five segments back from live by default, and three on
   Apple's station with `BURST_SECONDS=15`, which is where the restreamer joins.
 - **Signed addresses.** When a TuneIn address expires mid-stream, radioproxy
   fetches a new one and carries on in the same response, from the next segment.
+  This happens in the read-ahead, while the listener is sent what is in memory.
 - **Whole frames only.** The listener never receives part of an AAC frame.
 - **Reply.** `HTTP/1.1 200`, `Content-Type` of the audio (`audio/aac` for HLS),
   no length, ends when either side closes. A station that can't be opened gets
@@ -98,9 +103,9 @@ services:
 ```
 
 Settings: `PORT` (default `8010`), and `BURST_SECONDS` (unset: a head start of three segments).
-A small `BURST_SECONDS` leaves less margin at Apple's six-hourly re-signing, when
-nothing can be sent for a few seconds (about 10 when measured) and the listener
-plays from its head start. The data folder must be writable by the container's user
+Apple's six-hourly re-signing, when its addresses are refused for a few seconds
+(6 to 15 when measured), is covered by the read-ahead whatever `BURST_SECONDS` is.
+The data folder must be writable by the container's user
 (`sudo chown 10001:10001 radioproxy-data`); without it radioproxy runs the same, just without captures.
 
 GitHub Actions (`.github/workflows/image.yml`) builds the arm64 image on every

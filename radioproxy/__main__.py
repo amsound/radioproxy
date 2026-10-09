@@ -27,6 +27,7 @@ import aiohttp
 from .hls import HEAD_START_SEGMENTS, RESERVE_SEGMENTS
 from .http import USER_AGENT
 from .listener import DATA_DIR, Listener
+from .origin import PLAYLIST_TYPE, HlsOrigin, segment_type
 from .sources import TUNEIN_ID_RE, open_source, tunein_address
 
 logger = logging.getLogger("radioproxy")
@@ -74,6 +75,33 @@ async def _reply(writer: asyncio.StreamWriter, status: str, body: str, ctype: st
     await writer.drain()
 
 
+# A player's own web page fetches the playlist and segments (Cast does), so they must be readable from any origin.
+_CORS = (
+    "Access-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, HEAD, OPTIONS\r\n"
+    "Access-Control-Allow-Headers: *\r\nAccess-Control-Expose-Headers: Content-Length\r\n"
+)
+
+
+async def _reply_bytes(writer: asyncio.StreamWriter, data: bytes, ctype: str, *, head_only: bool = False) -> None:
+    writer.write(
+        f"HTTP/1.1 200 OK\r\nServer: radioproxy\r\nContent-Type: {ctype}\r\nContent-Length: {len(data)}\r\n"
+        f"Cache-Control: no-cache, no-store\r\n{_CORS}Connection: close\r\n\r\n".encode() + (b"" if head_only else data)
+    )
+    await writer.drain()
+
+
+def _hls_target(target: str) -> tuple[str, str | None] | None:
+    """(tunein id, segment name or None for the playlist) for an /hls/ request, or None if it isn't one."""
+    parts = target.split("?", 1)[0].split("/")
+    if len(parts) < 4 or parts[1] != "hls" or not TUNEIN_ID_RE.match(parts[2].lower()):
+        return None
+    if parts[3:] == ["index.m3u8"]:
+        return parts[2].lower(), None
+    if len(parts) == 5 and parts[3] == "seg" and parts[4]:
+        return parts[2].lower(), parts[4]
+    return None
+
+
 def _station(target: str) -> tuple[str, str | None, str, str] | None:
     """(label, tunein id or None, address, output) for a request target, or None if it isn't a stream.
 
@@ -98,6 +126,7 @@ class Server:
     def __init__(self) -> None:
         self._session: aiohttp.ClientSession | None = None
         self._listeners: dict[int, Listener] = {}
+        self._origins: dict[str, HlsOrigin] = {}   # stations being served as HLS, by TuneIn id
 
     async def handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
@@ -118,6 +147,9 @@ class Server:
             method, target, _ = request_line.split(" ", 2)
         except ValueError:
             return await _reply(writer, "400 Bad Request", "bad request")
+        hls = _hls_target(target)
+        if hls is not None and method in ("GET", "HEAD", "OPTIONS"):
+            return await self._serve_hls(writer, method, *hls)
         if method not in ("GET", "HEAD"):
             return await _reply(writer, "405 Method Not Allowed", "GET only")
         if target.split("?", 1)[0] == "/health":
@@ -133,6 +165,7 @@ class Server:
                     "hls_reserve_segments": RESERVE_SEGMENTS,
                     "captures": DATA_DIR,
                     "listeners": [x.status() for x in self._listeners.values()],
+                    "hls": [x.status() for x in self._origins.values()],
                 },
                 indent=2,
             )
@@ -142,7 +175,8 @@ class Server:
         if station is None:
             return await _reply(
                 writer, "404 Not Found",
-                "use /stream/<http|https>/<host>/<path>?<query> or /tunein/<station id> (add out=mp4 for MP4)",
+                "use /stream/<http|https>/<host>/<path>?<query> or /tunein/<station id> (add out=mp4 for MP4), "
+                "or /hls/<station id>/index.m3u8 for the station's own HLS",
             )
         name, tunein_id, address, output = station
         peer = (writer.get_extra_info("peername") or ("?",))[0]
@@ -208,6 +242,32 @@ class Server:
                 label, reason, listener.summary(), f"; capture {saved}" if saved else "",
             )
 
+    def _origin_stopped(self, origin: HlsOrigin) -> None:
+        if self._origins.get(origin.station) is origin:
+            del self._origins[origin.station]
+
+    async def _serve_hls(self, writer: asyncio.StreamWriter, method: str, station: str, name: str | None) -> None:
+        """The station's own HLS under an address that does not change (see origin.py)."""
+        if method == "OPTIONS":
+            writer.write(f"HTTP/1.1 204 No Content\r\n{_CORS}Content-Length: 0\r\nConnection: close\r\n\r\n".encode())
+            return await writer.drain()
+        peer = (writer.get_extra_info("peername") or ("?",))[0]
+        origin = self._origins.get(station)
+        if origin is None:
+            if name is not None:
+                return await _reply(writer, "404 Not Found", "ask for the playlist first")
+            origin = self._origins[station] = HlsOrigin(self._session, station, self._origin_stopped)
+        try:
+            if name is None:
+                return await _reply_bytes(writer, await origin.playlist(peer), PLAYLIST_TYPE, head_only=method == "HEAD")
+            data = await origin.segment(name, peer)
+        except Exception as exc:
+            logger.warning("%s %s failed: %s", origin.label, name or "playlist", exc or type(exc).__name__)
+            return await _reply(writer, "502 Bad Gateway", "the station could not be reached")
+        if data is None:
+            return await _reply(writer, "404 Not Found", "the station no longer has this segment")
+        await _reply_bytes(writer, data, segment_type(name), head_only=method == "HEAD")
+
     @staticmethod
     async def _pump(stream, writer: asyncio.StreamWriter, listener: Listener) -> None:
         async for chunk in stream.chunks():
@@ -234,6 +294,8 @@ class Server:
             loop.add_signal_handler(sig, stop.set)
         async with server:
             await stop.wait()
+        for origin in list(self._origins.values()):
+            await origin.close()
         await self._session.close()
 
 

@@ -16,6 +16,7 @@ The station is in the address. Nothing else to configure.
 | `/stream/<http or https>/<host>/<path>?<query>` | Any station address. Scheme first, then the station's own host, path and query, untouched. |
 | `/tunein/<station id>` | A TuneIn station, e.g. `/tunein/s345724`. Looked up fresh on every connect, and again whenever the signed address expires. |
 | either of the above, with `out=mp4` | The same station sent as fragmented MP4 instead of plain AAC (see below). |
+| `/hls/<station id>/index.m3u8` | A TuneIn station's own HLS, for a player that plays HLS itself, e.g. `/hls/s345724/index.m3u8` (see below). |
 | `/status` | Who is listening right now and how it is going (JSON). |
 | `/health` | Liveness check (used by the Docker healthcheck). |
 
@@ -80,6 +81,17 @@ AAC, transcoding.
 - **Signed addresses.** When a TuneIn address expires mid-stream, radioproxy
   fetches a new one and carries on in the same response, from the next segment.
   This happens in the read-ahead, while the listener is sent what is in memory.
+- **HLS under an address that does not change.** `/hls/<station id>/index.m3u8`
+  hands out the station's own live playlist with its segment lines pointing
+  back at radioproxy, and serves those segments untouched: nothing is converted,
+  paced or held back, and the player decides where to join and how much to
+  buffer. Behind that one address the station's signed addresses are renewed as
+  they expire, the newest four segments are downloaded as they appear and eight
+  are kept in memory, so a player never meets an expired address. One per
+  station, shared by whoever asks; it starts with the first request and stops
+  after 90 s without one. Replies carry `Access-Control-Allow-Origin: *`,
+  because Cast players fetch from a web page. `/status` lists each one under
+  `hls`, with its latest requests.
 - **Whole frames only.** The listener never receives part of an AAC frame.
 - **Reply.** `HTTP/1.1 200`, `Content-Type` of the audio (`audio/aac` for HLS),
   no length, ends when either side closes. A station that can't be opened gets
